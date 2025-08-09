@@ -39,9 +39,9 @@ def _naive_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    DTYPE_IN_FP8: tl.constexpr,
     DTYPE_ACC: tl.constexpr,
     DTYPE_ACC_TO: tl.constexpr,
-    FP8: tl.constexpr,
     # num_stages and num_warps can be included.
 ):
     """
@@ -86,7 +86,7 @@ def _naive_kernel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=DTYPE_ACC)
 
     # Iterate across the K dimension within the tile.
-    rem = K % BLOCK_SIZE_K
+    load_block_size_k = K % BLOCK_SIZE_K == 0
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         remaining = K - k * BLOCK_SIZE_K
         a, b = _global_vectorized_load(
@@ -94,8 +94,8 @@ def _naive_kernel(
             b_ptrs,
             offs_k,
             remaining,
-            REM=rem,
-            FP8=FP8,
+            LOAD_BLOCK_SIZE_K=load_block_size_k,
+            DTYPE_IN_FP8=DTYPE_IN_FP8,
         )
         accumulator = tl.dot(a, b, accumulator)
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -118,12 +118,12 @@ def naive_matmul(
     block_size_m: int,
     block_size_n: int,
     block_size_k: int,
+    dtype_in_fp8: bool,
     dtype_out: torch.dtype,
     dtype_acc: tl.dtype,
     dtype_acc_to: tl.dtype,
     num_stages: int,
     num_warps: int,
-    fp8: bool,
 ) -> torch.Tensor:
     """
     """
@@ -148,9 +148,9 @@ def naive_matmul(
         BLOCK_SIZE_M=block_size_m,
         BLOCK_SIZE_N=block_size_n,
         BLOCK_SIZE_K=block_size_k,
+        DTYPE_IN_FP8=dtype_in_fp8,
         DTYPE_ACC=dtype_acc,
         DTYPE_ACC_TO=dtype_acc_to,
-        FP8=fp8,
         num_stages=num_stages,
         num_warps=num_warps,
     )
@@ -159,6 +159,126 @@ def naive_matmul(
 
 # Optimized kernels and kernel launch function with the L2 cache efficient
 # program id mapping scheme.
+
+
+@jit
+def _l2_cache_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # Block sizes are tl.constexpr for recompilation if tiling changes.
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    DTYPE_IN_FP8: tl.constexpr,
+    DTYPE_ACC: tl.constexpr,
+    DTYPE_ACC_TO: tl.constexpr,
+    # num_stages and num_warps can be included.
+):
+    """
+    Multiplies FP8, FP16, and FP32 matrices with the L2 cache efficient program
+    id mapping scheme. The accumulator is FP32.
+    """
+    pid = tl.program_id(axis=0)
+    pid_m, pid_n = _compute_group_2d_pid(
+        pid, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
+
+    # Compute tile pointers.
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    if (pid_m * BLOCK_SIZE_M + BLOCK_SIZE_M < M):
+        offs_am = tl.max_contiguous(
+            tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
+    if (pid_n * BLOCK_SIZE_N + BLOCK_SIZE_N < N):
+        offs_bn = tl.max_contiguous(
+            tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = (a_ptr +
+              offs_am[:, None] * stride_am +
+              offs_k[None, :] * stride_ak)
+    b_ptrs = (b_ptr +
+              offs_k[:, None] * stride_bk +
+              offs_bn[None, :] * stride_bn)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=DTYPE_ACC)
+
+    # Iterate across the K dimension within the tile.
+    load_block_size_k = K % BLOCK_SIZE_K == 0
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        remaining = K - k * BLOCK_SIZE_K
+        a, b = _global_vectorized_load(
+            a_ptrs,
+            b_ptrs,
+            offs_k,
+            remaining,
+            LOAD_BLOCK_SIZE_K=load_block_size_k,
+            DTYPE_IN_FP8=DTYPE_IN_FP8,
+        )
+        accumulator = tl.dot(a, b, accumulator)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    # Store the result in unique location in global memory.
+    c = accumulator.to(DTYPE_ACC_TO)
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = (c_ptr +
+              stride_cm * offs_cm[:, None] +
+              stride_cn * offs_cn[None, :])
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+def l2_cache_matmul(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    block_size_m: int,
+    block_size_n: int,
+    block_size_k: int,
+    dtype_in_fp8: bool,
+    dtype_out: torch.dtype,
+    dtype_acc: tl.dtype,
+    dtype_acc_to: tl.dtype,
+    num_stages: int,
+    num_warps: int,
+) -> torch.Tensor:
+    """
+    """
+    assert a.shape[1] == b.shape[0], "Incompatible dimensions."
+    assert a.is_contiguous(), "Matrix A must be contiguous."
+    assert a.dtype == b.dtype, "Incompatible types."
+    M, K = a.shape
+    _, N = b.shape
+    c = torch.empty((M, N), device=a.device, dtype=dtype_out)
+    grid = lambda META: (cdiv(M, META["BLOCK_SIZE_M"]) *
+                         cdiv(N, META["BLOCK_SIZE_N"]), )
+    _l2_cache_kernel[grid](
+        a,
+        b,
+        c,
+        M,
+        N,
+        K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_K=block_size_k,
+        GROUP_SIZE_M=8,
+        DTYPE_IN_FP8=dtype_in_fp8,
+        DTYPE_ACC=dtype_acc,
+        DTYPE_ACC_TO=dtype_acc_to,
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+    return c
 
 
 # Optimized kernels and kernel launch function with the SplitK method.
@@ -182,6 +302,30 @@ def _compute_2d_pid(
     return pid_m, pid_n
 
 
+@jit
+def _compute_group_2d_pid(
+    pid,
+    M,
+    N,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """
+    Maps a consecutive 1D program id to a grouped 2D program id for L2
+    cache hit rate efficiency.
+    """
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
+
+
 # The accumulation with FP32 precision showed different sets of assembly
 # instructions for FP16 vs. FP8 data:
 # - FP32 matrix multiplication and addition instructions were used for
@@ -202,16 +346,16 @@ def _global_vectorized_load(
     b_ptrs,
     offs_k,
     remaining,
-    REM: tl.constexpr,
-    FP8: tl.constexpr,
+    LOAD_BLOCK_SIZE_K: tl.constexpr,
+    DTYPE_IN_FP8: tl.constexpr,
     ):
-    if FP8:
+    if DTYPE_IN_FP8:
         a, b = _global_vectorized_load_fp8(
             a_ptrs,
             b_ptrs,
             offs_k,
             remaining,
-            REM,
+            LOAD_BLOCK_SIZE_K,
         )
     else:
         a, b = _global_vectorized_load_fp16_fp32(
@@ -229,9 +373,9 @@ def _global_vectorized_load_fp8(
     b_ptrs,
     offs_k,
     remaining,
-    REM: tl.constexpr,
+    LOAD_BLOCK_SIZE_K: tl.constexpr,
 ):
-    if REM == 0:
+    if LOAD_BLOCK_SIZE_K:
         a = tl.load(a_ptrs)
         b = tl.load(b_ptrs)
     else:
@@ -267,6 +411,7 @@ class _matmul(torch.autograd.Function):
 
     fn = {
         "naive": naive_matmul,
+        "l2_cache": l2_cache_matmul,
     }
 
     @staticmethod
@@ -278,12 +423,12 @@ class _matmul(torch.autograd.Function):
         block_size_m: int,
         block_size_n: int,
         block_size_k: int,
+        dtype_in_fp8: bool,
         dtype_out: torch.dtype,
         dtype_acc: tl.dtype,
         dtype_acc_to: tl.dtype,
         num_stages: int,
         num_warps: int,
-        fp8: bool,
     ):
         c = _matmul.fn[mode](
             a,
@@ -291,12 +436,12 @@ class _matmul(torch.autograd.Function):
             block_size_m,
             block_size_n,
             block_size_k,
+            dtype_in_fp8,
             dtype_out,
             dtype_acc,
             dtype_acc_to,
             num_stages,
             num_warps,
-            fp8,
         )
         return c
 
@@ -304,9 +449,10 @@ class _matmul(torch.autograd.Function):
 class matmul:
 
     def __init__(self, mode: str = "naive"):
-        if mode not in ["naive"]:
+        if mode not in ["naive",
+                        "l2_cache"]:
             raise NotImplementedError(
-               "Usage: mode='naive'"
+               "Usage: mode='naive', mode='l2_cache'"
             )
         self.mode = mode
 
@@ -317,12 +463,12 @@ class matmul:
         block_size_m: int = 128,
         block_size_n: int = 128,
         block_size_k: int = 32,
+        dtype_in_fp8: bool = False,
         dtype_out: torch.dtype = torch.float16,
         dtype_acc: tl.dtype = tl.float32,
         dtype_acc_to: tl.dtype = tl.float16,
         num_stages: int = 3,
         num_warps: int = 4,
-        fp8: bool = False,
     ) -> torch.Tensor:
         c = _matmul.apply(
             a,
@@ -331,11 +477,11 @@ class matmul:
             block_size_m,
             block_size_n,
             block_size_k,
+            dtype_in_fp8,
             dtype_out,
             dtype_acc,
             dtype_acc_to,
             num_stages,
             num_warps,
-            fp8,
         )
         return c
