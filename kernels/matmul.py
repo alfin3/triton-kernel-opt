@@ -21,11 +21,12 @@ from triton import cdiv, jit
 from triton import language as tl
 
 
-# Kernels and kernel launch function with the naive program id mapping scheme.
+# Optimized kernels and kernel launch function with the L2 cache efficient
+# program id mapping scheme.
 
 
 @jit
-def _naive_kernel(
+def _group_m_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -39,18 +40,31 @@ def _naive_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
     DTYPE_IN_FP8: tl.constexpr,
     DTYPE_ACC: tl.constexpr,
     DTYPE_ACC_TO: tl.constexpr,
     # num_stages and num_warps can be included.
 ):
     """
-    Multiplies FP8, FP16, and FP32 matrices with the naive program id mapping
-    scheme. The accumulator is FP32.
+    Multiplies FP8, FP16, and FP32 matrices with the L2 cache efficient program
+    id mapping scheme. The accumulator is FP32.
+
+    Given a computed (m, n) program id, m corresponds to a block row of the
+    A matrix, n corresponds to a block column of the B matrix, and the (m, n)
+    program corresponds to a thread block that multiplies and accumulates
+    across the blocks in the K dimension. During the launch of the programs,
+    m is within a group of GROUP_SIZE_M block rows until n is completed, and m
+    is advanced to the next group. Therefore, m is grouped and n is not. The
+    A matrix should be contiguous for optimal cache line use.
+
+    The resulting increase in the L2 cache hit rate depends on the ordered
+    scheduling of thread blocks, which is not guaranteed by NVIDIA, but
+    approximately happens in practice at least on some systems.
     """
-    # Compute 2D program ids.
     pid = tl.program_id(axis=0)
-    pid_m, pid_n = _compute_2d_pid(pid, N, BLOCK_SIZE_N)
+    pid_m, pid_n = _compute_group_2d_pid(
+        pid, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
 
     # Compute tile pointers. Each tile is mapped to a thread block.
     # The below modulo operation ensures valid memory accesses for the values
@@ -112,130 +126,7 @@ def _naive_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-def naive_matmul(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    block_size_m: int,
-    block_size_n: int,
-    block_size_k: int,
-    dtype_in_fp8: bool,
-    dtype_out: torch.dtype,
-    dtype_acc: tl.dtype,
-    dtype_acc_to: tl.dtype,
-    num_stages: int,
-    num_warps: int,
-) -> torch.Tensor:
-    """
-    """
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions."
-    assert a.is_contiguous(), "Matrix A must be contiguous."
-    assert a.dtype == b.dtype, "Incompatible types."
-    M, K = a.shape
-    _, N = b.shape
-    c = torch.empty((M, N), device=a.device, dtype=dtype_out)
-    grid = lambda META: (cdiv(M, META['BLOCK_SIZE_M']) *
-                         cdiv(N, META['BLOCK_SIZE_N']), )
-    _naive_kernel[grid](
-        a,
-        b,
-        c,
-        M,
-        N,
-        K,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
-        c.stride(0), c.stride(1),
-        BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_n,
-        BLOCK_SIZE_K=block_size_k,
-        DTYPE_IN_FP8=dtype_in_fp8,
-        DTYPE_ACC=dtype_acc,
-        DTYPE_ACC_TO=dtype_acc_to,
-        num_stages=num_stages,
-        num_warps=num_warps,
-    )
-    return c
-
-
-# Optimized kernels and kernel launch function with the L2 cache efficient
-# program id mapping scheme.
-
-
-@jit
-def _l2_cache_kernel(
-    a_ptr,
-    b_ptr,
-    c_ptr,
-    M,
-    N,
-    K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    # Block sizes are tl.constexpr for recompilation if tiling changes.
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    DTYPE_IN_FP8: tl.constexpr,
-    DTYPE_ACC: tl.constexpr,
-    DTYPE_ACC_TO: tl.constexpr,
-    # num_stages and num_warps can be included.
-):
-    """
-    Multiplies FP8, FP16, and FP32 matrices with the L2 cache efficient program
-    id mapping scheme. The accumulator is FP32.
-    """
-    pid = tl.program_id(axis=0)
-    pid_m, pid_n = _compute_group_2d_pid(
-        pid, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
-
-    # Compute tile pointers.
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    if (pid_m * BLOCK_SIZE_M + BLOCK_SIZE_M < M):
-        offs_am = tl.max_contiguous(
-            tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
-    if (pid_n * BLOCK_SIZE_N + BLOCK_SIZE_N < N):
-        offs_bn = tl.max_contiguous(
-            tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = (a_ptr +
-              offs_am[:, None] * stride_am +
-              offs_k[None, :] * stride_ak)
-    b_ptrs = (b_ptr +
-              offs_k[:, None] * stride_bk +
-              offs_bn[None, :] * stride_bn)
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=DTYPE_ACC)
-
-    # Iterate across the K dimension within the tile.
-    load_block_size_k = K % BLOCK_SIZE_K == 0
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        remaining = K - k * BLOCK_SIZE_K
-        a, b = _global_vectorized_load(
-            a_ptrs,
-            b_ptrs,
-            offs_k,
-            remaining,
-            LOAD_BLOCK_SIZE_K=load_block_size_k,
-            DTYPE_IN_FP8=DTYPE_IN_FP8,
-        )
-        accumulator = tl.dot(a, b, accumulator)
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-
-    # Store the result in unique location in global memory.
-    c = accumulator.to(DTYPE_ACC_TO)
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = (c_ptr +
-              stride_cm * offs_cm[:, None] +
-              stride_cn * offs_cn[None, :])
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
-
-
-def l2_cache_matmul(
+def group_m_matmul(
     a: torch.Tensor,
     b: torch.Tensor,
     block_size_m: int,
@@ -258,7 +149,7 @@ def l2_cache_matmul(
     c = torch.empty((M, N), device=a.device, dtype=dtype_out)
     grid = lambda META: (cdiv(M, META["BLOCK_SIZE_M"]) *
                          cdiv(N, META["BLOCK_SIZE_N"]), )
-    _l2_cache_kernel[grid](
+    _group_m_kernel[grid](
         a,
         b,
         c,
@@ -284,22 +175,139 @@ def l2_cache_matmul(
 # Optimized kernels and kernel launch function with the SplitK method.
 
 
-# Auxiliary functions.
-
-
 @jit
-def _compute_2d_pid(
-    pid,
+def _group_m_split_k_kernel_fp16_fp32(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
     N,
+    K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # Block sizes are tl.constexpr for recompilation if tiling changes.
+    BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    DTYPE_ACC: tl.constexpr,
+    DTYPE_ACC_TO: tl.constexpr,
+    # num_stages and num_warps can be included.
 ):
     """
-    Maps a consecutive 1D program id to a 2D program id.
+    Multiplies FP16 and FP32 matrices with the L2 cache efficient program id
+    mapping scheme and the SplitK method.
+
+    The kernel is launched with a 2D grid of consecutive program ids and SplitK
+    start indices. The consecutive program ids are then mapped to (m, n) pairs
+    for L2 cache efficiency. Each (m, n) pair also corresponds to SPLIT_K
+    programs, each with a different start index in the K dimension. As a
+    result, the SplitK method adds thread blocks for each (m, n) pair.
     """
-    grid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    pid_m = pid // grid_n
-    pid_n = pid % grid_n
-    return pid_m, pid_n
+    pid = tl.program_id(axis=0)
+    pid_m, pid_n = _compute_group_2d_pid(
+        pid, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
+
+    # Compute tile pointers according to a SplitK start index.
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    if (pid_m * BLOCK_SIZE_M + BLOCK_SIZE_M < M):
+        offs_am = tl.max_contiguous(
+            tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
+    if (pid_n * BLOCK_SIZE_N + BLOCK_SIZE_N < N):
+        offs_bn = tl.max_contiguous(
+            tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+    offs_k = tl.program_id(axis=1) * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = (a_ptr +
+              offs_am[:, None] * stride_am +
+              offs_k[None, :] * stride_ak)
+    b_ptrs = (b_ptr +
+              offs_k[:, None] * stride_bk +
+              offs_bn[None, :] * stride_bn)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=DTYPE_ACC)
+
+    # Iterate across the K dimension within the tile.
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)):
+        remaining = K - k * BLOCK_SIZE_K * SPLIT_K
+        a, b = _global_vectorized_load_fp16_fp32(
+            a_ptrs,
+            b_ptrs,
+            offs_k,
+            remaining,
+        )
+        accumulator = tl.dot(a, b, accumulator)
+        a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
+
+    # Store the partial accumulations in global memory.
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = (c_ptr +
+              stride_cm * offs_cm[:, None] +
+              stride_cn * offs_cn[None, :])
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    # Repeat conversions and possible variance
+    # in the order of floating point operations and rounding.
+    c = accumulator.to(DTYPE_ACC_TO)
+    tl.atomic_add(c_ptrs, c, mask=c_mask)
+
+
+def group_m_split_k_matmul(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    block_size_m: int,
+    block_size_n: int,
+    block_size_k: int,
+    dtype_in_fp8: bool,
+    dtype_out: torch.dtype,
+    dtype_acc: tl.dtype,
+    dtype_acc_to: tl.dtype,
+    num_stages: int,
+    num_warps: int,
+) -> torch.Tensor:
+    """
+    """
+    assert a.shape[1] == b.shape[0], "Incompatible dimensions."
+    assert a.is_contiguous(), "Matrix A must be contiguous."
+    assert a.dtype == b.dtype, "Incompatible types."
+    if dtype_in_fp8:
+        raise NotImplementedError(
+            "The _group_m_split_k_kernel does not work with FP8 data."
+        )
+    M, K = a.shape
+    _, N = b.shape
+    # Initialize to zeros, not empty, due to reduction.
+    c = torch.zeros((M, N), device=a.device, dtype=dtype_out)
+    grid = lambda META: (
+        cdiv(M, META["BLOCK_SIZE_M"]) * cdiv(N, META["BLOCK_SIZE_N"]),
+        META["SPLIT_K"],
+    )
+    _group_m_split_k_kernel_fp16_fp32[grid](
+        a,
+        b,
+        c,
+        M,
+        N,
+        K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_K=block_size_k,
+        GROUP_SIZE_M=8,
+        SPLIT_K=4,
+        DTYPE_ACC=dtype_acc,
+        DTYPE_ACC_TO=dtype_acc_to,
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+    return c
+
+
+# Auxiliary functions.
 
 
 @jit
@@ -330,8 +338,8 @@ def _compute_group_2d_pid(
 # instructions for FP16 vs. FP8 data:
 # - FP32 matrix multiplication and addition instructions were used for
 # FP16 data, and
-# - 32-bit integer multiplication and addition instructions as well as
-# register permutation instructions were used for FP8 data.
+# - integer multiplication and addition instructions (including 32-bit), as
+# well as register permutation instructions were used for FP8 data.
 # The following separation into '_global_vectorized_load_fp8' and
 # '_global_vectorized_load_fp16_fp32' was determined to be necessary for the
 # generation of 128-bit vectorized global memory load instructions across
@@ -410,8 +418,8 @@ def _global_vectorized_load_fp16_fp32(
 class _matmul(torch.autograd.Function):
 
     fn = {
-        "naive": naive_matmul,
-        "l2_cache": l2_cache_matmul,
+        "group_m": group_m_matmul,
+        "group_m_split_k": group_m_split_k_matmul,
     }
 
     @staticmethod
@@ -448,11 +456,11 @@ class _matmul(torch.autograd.Function):
 
 class matmul:
 
-    def __init__(self, mode: str = "naive"):
-        if mode not in ["naive",
-                        "l2_cache"]:
+    def __init__(self, mode: str = "group_m"):
+        if mode not in ["group_m",
+                        "group_m_split_k"]:
             raise NotImplementedError(
-               "Usage: mode='naive', mode='l2_cache'"
+               "Usage: mode='group_m', mode='group_m_split_k'"
             )
         self.mode = mode
 
